@@ -11,7 +11,7 @@ from __future__ import annotations
 from typing import Any
 
 from line_control.feed.arbiter import PROTECTION, Demand
-from line_control.feed.controller import FeedController
+from line_control.feed.controller import MAX_LIMIT, FeedController
 from line_control.interlock.board import InterlockBoard
 from line_control.judgement.thresholds import Band, ThresholdVerdict, ThresholdWindow
 from line_control.registry.parameters import Bounds, ParameterRegistry, ParameterSpec
@@ -21,6 +21,7 @@ from line_control.runtime.keys import scope_key
 from line_control.store.stream import RecordStream
 
 TEMP_LIMIT = 600
+RUNBACK_DEMAND = 30
 CHANNEL = "exhaust"
 LATCH = "exhaust_overtemp"
 WINDOW = 10
@@ -141,12 +142,16 @@ class CombustionController:
     # ----------------------------------------------------------- write paths
     def sample(self, unit: str, temperature: int) -> dict[str, Any]:
         """Record one exhaust sample."""
+        self.channel(unit).observe(unit, temperature)
         record = self._stream.append(
             "exhaust.sample",
             scope_key("exhaust", unit, "latest"),
             {"unit": unit, "value": int(temperature)},
         )
         self._stream.commit_upto(record.seq)
+        if not self.band(unit).contains(float(temperature)):
+            self._board.set_latch(unit, LATCH, "exhaust over-temperature")
+            self._feed.lower_limit(unit, 0)
         return self.status(unit)
 
     def protect(self, unit: str, temperature: int) -> Demand:
@@ -163,7 +168,7 @@ class CombustionController:
 
     def protection_demand(self, unit: str, temperature: int) -> int:
         """Return the feed demand an over-temperature reading calls for."""
-        return 100
+        return RUNBACK_DEMAND
 
     def set_average(self, unit: str, temperature: int) -> dict[str, Any]:
         """Record the averaged exhaust temperature."""
@@ -197,9 +202,9 @@ class CombustionController:
 
     def reset(self, unit: str, observed: int) -> dict[str, Any]:
         """Clear the alarm, refusing while the observed temperature is still hot."""
-        self._board.clear_latch(
-            unit, LATCH, True, note="operator reset"
-        )
+        cooled = self.band(unit).contains(float(observed))
+        self._board.clear_latch(unit, LATCH, cooled, note="operator reset")
+        self._feed.raise_limit(unit, MAX_LIMIT)
         self._feed.unlatch(unit)
         return self.status(unit)
 
